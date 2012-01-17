@@ -7,7 +7,8 @@ use 5.10.1;
 
 =head1 NAME
 
-Gallery - perl module for nginx.
+Nginx::Module::Gallery - Gallery perl module for nginx. Like simple file index
+but thumbnail replace default icon for image.
 
 =head1 SYNOPSIS
 
@@ -44,28 +45,123 @@ All icons cached on first request. Next show will be more fast.
 
 =cut
 
-# Module version
-our $VERSION = 0.01;
+=head1 VARIABLES
 
-# Max icon size
-our $ICON_SIZE              = 100;
-# Icon comression level 0-9
+=cut
+
+# Module version
+our $VERSION = 0.2.0;
+
+=head2 ICON_MAX_DIMENSION
+
+Max icon dimension. In pixels. All thumbnails well be resized to this dimension.
+
+=cut
+
+our $ICON_MAX_DIMENSION     = 100; # pixels
+
+=head2 ICON_MAX_SIZE
+
+Max icon size. In bytes. Default 128Kb.
+
+=cut
+
+our $ICON_MAX_SIZE          = 131072; # bytes
+
+=head2 ICON_COMPRESSION_LEVEL
+
+Icon comression level 0-9 for use in PNG
+
+=cut
+
 our $ICON_COMPRESSION_LEVEL = 9;
 
-# Path to cache and mode
+=head2 ICON_QUALITY_LEVEL
+
+Icon quality level 0-9 for use in videos
+
+=cut
+
+our $ICON_QUALITY_LEVEL = 0;
+
+=head2 CACHE_PATH
+
+Path for thumbnails cache
+
+=cut
+
 our $CACHE_PATH     = '/var/cache/gallery';
+
+=head2 CACHE_MODE
+
+Mode for created thumbnails
+
+=cut
+
 our $CACHE_MODE     = 0755;
-# Template path
+
+=head2 TEMPLATE_PATH
+
+Templates path
+
+=cut
+
 our $TEMPLATE_PATH  = '/home/rubin/workspace/gallery/templates';
-# Icons path
+
+=head2 ICONS_PATH
+
+Path for MIME and other icons
+
+=cut
+
 our $ICONS_PATH     = '/home/rubin/workspace/gallery/icons';
+
+=head2 VIDEO_THUMBNAILER
+
+Video thumbnailer command for sprintf. First %s - onput file path, second %s
+ - output file path.
+
+=cut
+
+our $VIDEO_THUMBNAILER = '/usr/bin/ffmpegthumbnailer' .
+    " -i %s" .
+    " -o %s" .
+    " -s $ICON_MAX_DIMENSION" .
+    " -q $ICON_QUALITY_LEVEL";
+
+=head2 IMAGE_THUMBNAILER
+
+Image thumbnailer command for sprintf. First %s - onput file path, second %s
+ - output file path.
+
+=cut
+
+our $IMAGE_THUMBNAILER = '/usr/bin/convert' .
+    " %s" .
+    " -quiet" .
+    " -auto-orient" .
+    " -quality $ICON_COMPRESSION_LEVEL" .
+#    " -unsharp 0x.5" .
+    " -thumbnail '$ICON_MAX_DIMENSION".'x'."$ICON_MAX_DIMENSION>'" .
+    " -delete 1--1" .
+    " %s";
+
+=head2 IMAGE_PARAMS
+
+Command for get image params like width, height, etc.
+
+=cut
+
+our $IMAGE_PARAMS = '/usr/bin/identify -format "%%wx%%h %%b" %s';
+
 # Fixed icons
 use constant ICON_FOLDER    => 'folder';
 use constant ICON_UPDIR     => 'edit-undo';
-
+use constant ICON_FAVICON   => 'emblem-photos';
+# MIME type of unknown files
 use constant MIME_UNKNOWN   => 'x-unknown/x-unknown';
 
-use nginx;
+use nginx 1.1.11;
 
 use Mojo::Template;
 use MIME::Base64 qw(encode_base64);
@@ -73,27 +169,38 @@ use MIME::Types;
 use File::Spec;
 use File::Basename;
 use File::Path qw(make_path);
+use File::Temp qw(tempfile);
 use Digest::MD5 'md5_hex';
 use List::MoreUtils qw(any);
 
-use GD;
-# Enable truecolor
-GD::Image->trueColor(1);
-
 # MIME definition objects
 our $mimetypes = MIME::Types->new;
-our $unknown   = MIME::Type->new(
+our $mime_unknown   = MIME::Type->new(
     encoding    => 'base64',
     simplified  => 'unknown/unknown',
     type        => 'x-unknown/x-unknown'
 );
+our $mime_png   = $mimetypes->mimeTypeOf( 'png' );
+
+=head1 FUNCTIONS
+
+=cut
+
+=head2 handler $r
+
+Main loop handler
+
+=cut
 
 sub handler($)
 {
     my $r = shift;
 
-    # Stop unless GET
-    return HTTP_BAD_REQUEST unless $r->request_method eq 'GET';
+    # Stop unless GET or HEAD
+    return HTTP_BAD_REQUEST
+        unless $r->request_method eq 'GET' or $r->request_method eq 'HEAD';
+    # Return favicon
+    return show_favicon($r) if $r->filename =~ m{favicon\.png$}i;
     # Stop unless dir or file
     return HTTP_NOT_FOUND unless -f $r->filename or -d _;
     # Stop if header only
@@ -105,7 +212,7 @@ sub handler($)
     return show_index($r);
 }
 
-=head1 FUNCTIONS
+=head1 PRIVATE FUNCTIONS
 
 =cut
 
@@ -120,6 +227,27 @@ sub show_image($)
     my $r = shift;
     $r->send_http_header;
     $r->sendfile( $r->filename );
+    return OK;
+}
+
+=head2 show_favicon
+
+Send favicon
+
+=cut
+
+sub show_favicon($)
+{
+    my $r = shift;
+
+    # Path to favicon
+    my $favicon_path = File::Spec->catfile(
+        $ICONS_PATH . '/' . ICON_FAVICON . '.png' );
+    # MIME of favicon
+    my $mime = $mimetypes->mimeTypeOf( $favicon_path ) || $mime_unknown;
+
+    $r->send_http_header("$mime");
+    $r->sendfile( $favicon_path );
     return OK;
 }
 
@@ -148,7 +276,13 @@ sub show_index($)
 
     # Send top of index page
     $r->send_http_header("text/html");
-    $r->print( $mt->render( _template('top'), $TEMPLATE_PATH, $title ) );
+    $r->print(
+        $mt->render(
+            _template('top'),
+            $TEMPLATE_PATH,
+            $title
+        )
+    );
 
     # Add updir for non root directory
     unless( $r->uri eq '/' )
@@ -185,7 +319,7 @@ sub show_index($)
         # Get filename
         my ($filename, $dir) = File::Basename::fileparse($path);
         my ($digit, $letter, $bytes, $human) = _as_human_size( -s $path );
-        my $mime = $mimetypes->mimeTypeOf( $path ) || $unknown;
+        my $mime = $mimetypes->mimeTypeOf( $path ) || $mime_unknown;
 
         # Make item info hash
         my %item = (
@@ -210,21 +344,26 @@ sub show_index($)
             delete $item{mime};
         }
         # For images make icons and get some information
-        elsif( $mime->mediaType eq 'image' )
+        elsif( $mime->mediaType eq 'image' or $mime->mediaType eq 'video' )
         {
+            # Has thumbnail
+            $item{icon}{thumb}      = 1;
+
             # Load icon from cache
             my $icon = get_icon_form_cache( $path );
             # Try to make icon
             unless( $icon )
             {
-                $icon = make_icon( $path );
+                $icon = make_icon( $path, $mime, $r );
                 # Try to save in cache
                 save_icon_in_cache( $path, $icon ) if $icon;
             }
-            # Make generic image icon
+            # Make mime image icon
             unless( $icon )
             {
-                $icon = _icon_generic( $path );
+                $icon = _icon_mime( $path );
+                # Can`t create/load thumbnail
+                delete $item{icon}{thumb};
             }
 
             # Save icon and some image information
@@ -235,11 +374,11 @@ sub show_index($)
             $item{image}{height}    = $icon->{image}{height}
                 if defined $icon->{image}{height};
         }
-        # Show gemeric icon for file
+        # Show mime icon for file
         else
         {
-            # Load icon from cache
-            my $icon = _icon_generic( $path );
+            # Load mime icon
+            my $icon = _icon_mime( $path );
 
             # Save icon and some image information
             $item{icon}{raw}        = $icon->{raw};
@@ -372,70 +511,82 @@ Get $path of image and make icon for it
 
 =cut
 
-sub make_icon($)
+sub make_icon($;$$)
 {
-    my ($path) = @_;
+    my ($path, $mime, $r) = @_;
 
-    # Get image
-    open my $f, '<:raw', $path or return ();
-    local $/;
-    my $raw = <$f>;
-    close $f;
-
-    # Load image
-    my $image   = GD::Image->new( $raw );
-    return unless $image;
+    # Get MIME type
+    $mime //= $mimetypes->mimeTypeOf( $path ) || $mime_unknown;
 
     # Count icon width and height
-    my ($image_width, $image_height, $width, $height);
+    my ($raw, $image_width, $image_height, $image_size);
 
-    $image_width  = $width  = $image->width;
-    $image_height = $height = $image->height;
-    if($width <= $ICON_SIZE and $height <= $ICON_SIZE)
+    if($mime->subType eq 'vnd.microsoft.icon')
     {
-        ;
+        # Show just small icons
+        return unless -s $path < $ICON_MAX_SIZE;
+
+        # Get image
+        open my $fh, '<:raw', $path or return;
+        local $/;
+        $raw = <$fh>;
+        close $fh or return;
+        return unless $raw;
     }
-    elsif($width > $height)
+    elsif( $mime->mediaType eq 'video')
     {
-        $height = int( $ICON_SIZE * $height / $width || 1 );
-        $width  = $ICON_SIZE;
-    }
-    elsif($width < $height)
-    {
-        $width  = int( $ICON_SIZE * $width / $height || 1 );
-        $height = $ICON_SIZE;
+        my $filepath = _escape_path $path;
+
+        # Convert to temp thumbnail file
+        my ($fh, $filename) =
+            tempfile( UNLINK => 1, OPEN => 1, SUFFIX => '.png' );
+        system( sprintf $VIDEO_THUMBNAILER, $filepath, $filename );
+        return unless $fh;
+
+        # Get image
+        local $/;
+        $raw = <$fh>;
+        close $fh or return;
+        return unless $raw;
+
+        $mime = $mime_png || $mime_unknown;
     }
     else
     {
-        $width  = $ICON_SIZE;
-        $height = $ICON_SIZE;
+        my $filepath = _escape_path $path;
+
+        # Get image params
+        my $exec = sprintf $IMAGE_PARAMS, $filepath;
+        my $params = `$exec`;
+        ($image_width, $image_height, $image_size) =
+            $params =~ m/^(\d+)x(\d+) (\d+)$/;
+
+        # Convert to temp thumbnail file
+        my ($fh, $filename) =
+            tempfile( UNLINK => 1, OPEN => 1, SUFFIX => '.png' );
+        system( sprintf $IMAGE_THUMBNAILER, $filepath, $filename );
+        return unless $fh;
+
+        # Get image
+        local $/;
+        $raw = <$fh>;
+        close $fh or return;
+        return unless $raw;
+
+        # Get mime type as icon type
+        $mime = $mime_png || $mime_unknown;
     }
 
-    # Create icon image
-    my $icon = GD::Image->new( $width, $height, 1 );
-    return unless $icon;
-    # Fill white
-    $icon->fill(0, 0, $icon->colorAllocate(255,255,255) );
-    # Copy and resize from original image
-    $icon->copyResampled($image, 0, 0, 0, 0,
-        $width, $height,
-        $image_width, $image_height
-    );
-
-    # Make BASE64 encoding for inline
-    $raw = MIME::Base64::encode_base64( $icon->png( $ICON_COMPRESSION_LEVEL ) );
-
-    # Get mime type as icon type
-    my $mime = $mimetypes->mimeTypeOf( 'png' ) || $unknown;
+    # Make as is BASE64 encoding for inline
+    $raw = MIME::Base64::encode_base64( $raw );
 
     return {
         raw     => $raw,
         mime    => $mime,
-        width   => $width,
-        height  => $height,
         image   => {
             width   => $image_width,
             height  => $image_height,
+            size    => $image_size,
         },
     };
 }
@@ -482,44 +633,44 @@ sub _icon_common
     my $icon_path = File::Spec->catfile($ICONS_PATH, $name.'.png');
 
     # Load icon
-    my $icon = GD::Image->new( $icon_path );
-    return unless $icon;
+    open my $fh, '<:raw', $icon_path or return;
+    local $/;
+    my $raw = <$fh>;
+    close $fh or return;
+    return unless $raw;
 
-    # Save alpha channel
-    $icon->saveAlpha(1);
+    # Make as is BASE64 encoding for inline
+    $raw = MIME::Base64::encode_base64( $raw );
 
     # Encode icon
-    $common{$name}{raw}     =
-        MIME::Base64::encode_base64( $icon->png( $ICON_COMPRESSION_LEVEL ) );
+    $common{$name}{raw}     = $raw;
     $common{$name}{mime}    = $mimetypes->mimeTypeOf( $icon_path );
-    $common{$name}{width}   = $icon->width;
-    $common{$name}{height}  = $icon->height;
 
     return $common{$name};
 }
 
-=head2 _icon_generic $path
+=head2 _icon_mime $path
 
-Return generic icon for file by $path
+Return mime icon for file by $path
 
 =cut
 
-sub _icon_generic
+sub _icon_mime
 {
     my ($path) = @_;
 
     my ($filename, $dir) = File::Basename::fileparse($path);
     my ($extension) = $filename =~ m{\.(\w+)$};
 
-    my $mime    = $mimetypes->mimeTypeOf( $path ) || $unknown;
+    my $mime    = $mimetypes->mimeTypeOf( $path ) || $mime_unknown;
     my $str     = "$mime";
     my $media   = $mime->mediaType;
     my $sub     = $mime->subType;
     my $full    = join '-', $mime =~ m{^(.*?)/(.*)$};
 
     # Return icon if already loaded
-    our %generic;
-    return $generic{$str} if $generic{$str};
+    our %mime;
+    return $mime{$str} if $mime{$str};
 
     my @icon_path = (
         # Full MIME type
@@ -537,37 +688,36 @@ sub _icon_generic
     );
 
     # Load icon from varios paths
-    my ($icon, $icon_path);
+    my ($raw, $icon_path);
     for my $search_path ( @icon_path )
     {
         # Skip if file not exists
         next unless -f $search_path;
 
-        # Skip if can`t load image
-        my $try = GD::Image->new( $search_path );
-        next unless $try;
+        # Load icon
+        open my $fh, '<:raw', $search_path or next;
+        local $/;
+        $raw = <$fh>;
+        close $fh or next;
+        next unless $raw;
 
         # Save icon and stop search
-        $icon      = $try;
         $icon_path = $search_path;
         last;
     }
     # Try to load default icon for unknown type
-    return _icon_generic( MIME_UNKNOWN ) if ! $icon and $mime ne MIME_UNKNOWN;
+    return _icon_mime( MIME_UNKNOWN ) if ! $raw and $mime ne MIME_UNKNOWN;
     # Return unless icon =(
-    return unless $icon;
+    return unless $raw;
 
-    # Save alpha channel
-    $icon->saveAlpha(1);
+    # Make as is BASE64 encoding for inline
+    $raw = MIME::Base64::encode_base64( $raw );
 
     # Encode icon
-    $generic{$str}{raw}     =
-        MIME::Base64::encode_base64( $icon->png( $ICON_COMPRESSION_LEVEL ) );
-    $generic{$str}{mime}    = $mimetypes->mimeTypeOf( $icon_path );
-    $generic{$str}{width}   = $icon->width;
-    $generic{$str}{height}  = $icon->height;
+    $mime{$str}{raw}     = $raw;
+    $mime{$str}{mime}    = $mimetypes->mimeTypeOf( $icon_path );
 
-    return $generic{$str};
+    return $mime{$str};
 }
 
 =head2 as_human_size(NUM)
@@ -633,9 +783,9 @@ sub _as_human_size($)
 
 =head1 AUTHORS
 
-Copyright (C) 2011 Dmitry E. Oboukhov <unera@debian.org>,
+Copyright (C) 2012 Dmitry E. Oboukhov <unera@debian.org>,
 
-Copyright (C) 2011 Roman V. Nikolaev <rshadow@rambler.ru>
+Copyright (C) 2012 Roman V. Nikolaev <rshadow@rambler.ru>
 
 =head1 LICENSE
 
