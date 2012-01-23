@@ -50,7 +50,7 @@ All icons cached on first request. Next show will be more fast.
 =cut
 
 # Module version
-our $VERSION = 0.2.2;
+our $VERSION = 0.2.3;
 
 =head2 ICON_MAX_DIMENSION
 
@@ -74,7 +74,7 @@ Icon comression level 0-9 for use in PNG
 
 =cut
 
-our $ICON_COMPRESSION_LEVEL = 9;
+our $ICON_COMPRESSION_LEVEL = 95;
 
 =head2 ICON_QUALITY_LEVEL
 
@@ -116,44 +116,6 @@ Path for MIME and other icons
 
 our $ICONS_PATH     = '/home/rubin/workspace/gallery/icons';
 
-=head2 VIDEO_THUMBNAILER
-
-Video thumbnailer command for sprintf. First %s - onput file path, second %s
- - output file path.
-
-=cut
-
-our $VIDEO_THUMBNAILER = '/usr/bin/ffmpegthumbnailer' .
-    " -i %s" .
-    " -o %s" .
-    " -s $ICON_MAX_DIMENSION" .
-    " -q $ICON_QUALITY_LEVEL";
-
-=head2 IMAGE_THUMBNAILER
-
-Image thumbnailer command for sprintf. First %s - onput file path, second %s
- - output file path.
-
-=cut
-
-our $IMAGE_THUMBNAILER = '/usr/bin/convert' .
-    " %s" .
-    " -quiet" .
-    " -auto-orient" .
-    " -quality $ICON_COMPRESSION_LEVEL" .
-#    " -unsharp 0x.5" .
-    " -thumbnail '$ICON_MAX_DIMENSION".'x'."$ICON_MAX_DIMENSION>'" .
-    " -delete 1--1" .
-    " %s";
-
-=head2 IMAGE_PARAMS
-
-Command for get image params like width, height, etc.
-
-=cut
-
-our $IMAGE_PARAMS = '/usr/bin/identify -format "%%wx%%h %%b" %s';
-
 # Fixed icons
 use constant ICON_FOLDER    => 'folder';
 use constant ICON_UPDIR     => 'edit-undo';
@@ -170,8 +132,10 @@ use File::Spec;
 use File::Basename;
 use File::Path qw(make_path);
 use File::Temp qw(tempfile);
+use File::Find;
 use Digest::MD5 'md5_hex';
 use List::MoreUtils qw(any);
+use URI::Escape qw(uri_escape);
 
 # MIME definition objects
 our $mimetypes = MIME::Types->new;
@@ -264,18 +228,19 @@ sub show_index($)
     # Templates
     our %template;
     my $mt = Mojo::Template->new;
+    $mt->encoding('UTF-8');
     # Mime type
     our %icon;
 
     # Make title from path
-    my @tpath = split m{/}, $r->uri;
+    my @tpath =  File::Spec->splitdir( $r->uri );
     shift @tpath;
     push @tpath, '/' unless @tpath;
     my $title = 'Gallery - ' . join ' : ', @tpath;
     undef @tpath;
 
     # Send top of index page
-    $r->send_http_header("text/html");
+    $r->send_http_header("text/html; charset=utf-8");
     $r->print(
         $mt->render(
             _template('top'),
@@ -290,8 +255,8 @@ sub show_index($)
         # make link on updir
         my @updir = File::Spec->splitdir( $r->uri );
         pop @updir;
+        $_ = uri_escape $_ for @updir;
         my $updir = File::Spec->catdir( @updir );
-        undef @updir;
 
         my $icon = _icon_common( ICON_UPDIR );
 
@@ -310,7 +275,7 @@ sub show_index($)
     }
 
     # Get directory index
-    my $mask  = File::Spec->catfile( _escape_path( $r->filename ), '*' );
+    my $mask  = File::Spec->catfile( _escape_path($r->filename), '*' );
     my @index = sort {-d $b cmp -d $a} sort {uc $a cmp uc $b} glob $mask;
 
     # Create index
@@ -321,11 +286,16 @@ sub show_index($)
         my ($digit, $letter, $bytes, $human) = _as_human_size( -s $path );
         my $mime = $mimetypes->mimeTypeOf( $path ) || $mime_unknown;
 
+        my @href = File::Spec->splitdir( $r->uri );
+        push @href, $filename;
+        $_ = uri_escape $_ for @href;
+        my $href = File::Spec->catfile( @href );
+
         # Make item info hash
         my %item = (
             path        => $path,
             filename    => $filename,
-            href        => File::Spec->catfile($r->uri, $filename),
+            href        => $href,
             size        => $human,
             mime        => $mime,
         );
@@ -405,20 +375,6 @@ sub _get_md5_image($)
     my ($path) = @_;
     my ($size, $mtime) = ( stat($path) )[7,9];
     return md5_hex join( ',', $path, $size, $mtime );
-}
-
-=head2 _escape_path $path
-
-Return escaped $path
-
-=cut
-
-sub _escape_path($)
-{
-    my ($path) = @_;
-    my $escaped = $path;
-    $escaped =~ s{([\s'".?*])}{\\$1}g;
-    return $escaped;
 }
 
 =head2 get_icon_form_cache $path
@@ -535,13 +491,20 @@ sub make_icon($;$$)
     }
     elsif( $mime->mediaType eq 'video')
     {
-        my $filepath = _escape_path $path;
+        # Full file read
+        local $/;
 
         # Convert to temp thumbnail file
         my ($fh, $filename) =
             tempfile( UNLINK => 1, OPEN => 1, SUFFIX => '.png' );
-        system( sprintf $VIDEO_THUMBNAILER, $filepath, $filename );
         return unless $fh;
+
+        system '/usr/bin/ffmpegthumbnailer',
+            '-s', $ICON_MAX_DIMENSION,
+            '-q', $ICON_QUALITY_LEVEL,
+#            '-f',
+            '-i', $path,
+            '-o', $filename;
 
         # Get image
         local $/;
@@ -553,24 +516,33 @@ sub make_icon($;$$)
     }
     else
     {
-        my $filepath = _escape_path $path;
+        # Full file read
+        local $/;
 
         # Get image params
-        my $exec = sprintf $IMAGE_PARAMS, $filepath;
-        my $params = `$exec`;
+        open my $pipe1, '-|:utf8',
+            '/usr/bin/identify',
+            '-format', '%wx%h %b',
+            $path;
+        my $params = <$pipe1>;
+        close $pipe1;
+
         ($image_width, $image_height, $image_size) =
             $params =~ m/^(\d+)x(\d+)\s+(\d+)[a-zA-Z]*\s*$/;
 
-        # Convert to temp thumbnail file
-        my ($fh, $filename) =
-            tempfile( UNLINK => 1, OPEN => 1, SUFFIX => '.png' );
-        system( sprintf $IMAGE_THUMBNAILER, $filepath, $filename );
-        return unless $fh;
-
-        # Get image
-        local $/;
-        $raw = <$fh>;
-        close $fh or return;
+        open my $pipe2, '-|:raw',
+            '/usr/bin/convert',
+            '-quiet',
+            '-strip',
+            '-delete', '1--1',
+            $path,
+            '-auto-orient',
+            '-quality', $ICON_COMPRESSION_LEVEL,
+            '-thumbnail', $ICON_MAX_DIMENSION.'x'.$ICON_MAX_DIMENSION.'>',
+            '-colorspace', 'RGB',
+            '-';
+        $raw = <$pipe2>;
+        close $pipe2;
         return unless $raw;
 
         # Get mime type as icon type
@@ -777,6 +749,20 @@ sub _as_human_size($)
     return ($result{digit}, $result{letter}, $result{byte}, $result{human})
         if wantarray;
     return $result{human};
+}
+
+=head2 _escape_path $path
+
+Return escaped $path
+
+=cut
+
+sub _escape_path($)
+{
+    my ($path) = @_;
+    my $escaped = $path;
+    $escaped =~ s{([\s'".?*\(\)\+\}\{\]\[])}{\\$1}g;
+    return $escaped;
 }
 
 1;
