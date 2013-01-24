@@ -1,3 +1,11 @@
+0.3.0 (03.07.2012)
+    Configuration variables in nginx.conf
+    Remove inline, base64 thumbnails
+    Now some static files nginx send directly by prefix
+    Directory index more sensivety by event base
+    Add help layer
+    Bug fixes
+
 0.2.3 (23.01.2012)
     Fix path and uri escaping
     Optimize thumbnails creation
